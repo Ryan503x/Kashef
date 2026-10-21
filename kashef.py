@@ -452,6 +452,9 @@ class AdvancedCrawler:
         https_fallback=True,
         extra_headers=None,
         proxies=None,
+        mine_assets=True,
+        probe_endpoints=False,
+        max_asset_bytes=26214400,  # 25 MiB; JS bundles are big (main.js can be 10-20 MiB)
     ):
         self.visited = set()
         self.to_visit = deque()
@@ -463,6 +466,9 @@ class AdvancedCrawler:
         # HTTP(S) links discovered outside the configured crawl scope. These
         # are reported only and are never added to the crawl queue.
         self.out_of_scope_links = set()
+        # In-scope API/route endpoints mined from JS/JSON bodies (not present
+        # in any HTML; a browser only reaches them by executing the bundle).
+        self.api_endpoints = set()
         self.base_domain = ""
         self.domain_ip = None  # Store resolved IP
         self.max_workers = max(1, int(max_workers))
@@ -471,6 +477,12 @@ class AdvancedCrawler:
         self.max_response_bytes = max(1024, int(max_response_bytes))
         self.request_retries = max(1, int(request_retries))
         self.https_fallback = bool(https_fallback)
+        # Mine JS/JSON bodies for endpoint strings (on by default). Probing
+        # actively GETs the in-scope ones discovered; off by default because a
+        # bundle can reference hundreds of state-changing endpoints.
+        self.mine_assets = bool(mine_assets)
+        self.probe_endpoints = bool(probe_endpoints)
+        self.max_asset_bytes = max(self.max_response_bytes, int(max_asset_bytes))
         self.crawled_count = 0
         self.found_files = set()
         self.crawl_subdomains = crawl_subdomains
@@ -502,6 +514,21 @@ class AdvancedCrawler:
             deny_extensions=(),
             canonicalize=False,
         )
+
+        # Endpoint miners for JS/JSON bodies. _ENDPOINT_ABS matches whole URLs;
+        # _ENDPOINT_PATH matches quoted path literals like "/api/Account/Login"
+        # (two or more segments, terminated by a quote, '?' or '#' so a trailing
+        # query delimiter doesn't break the match).
+        self._endpoint_abs_re = re.compile(r'''https?://[^\s"'`<>()\[\]{}\\]+''')
+        self._endpoint_path_re = re.compile(
+            r'''["'`](/[A-Za-z][\w\-.]*(?:/[\w\-.%]+)+)(?=[?#"'`])'''
+        )
+        # Hosts that only ever appear as framework/library noise in bundles;
+        # never report them as discovered endpoints.
+        self._endpoint_noise_hosts = frozenset({
+            'www.w3.org', 'w3.org', 'g.co', 'example.com', 'angular.io',
+            'schema.org', 'www.google.com', 'fonts.googleapis.com', 'fonts.gstatic.com',
+        })
 
     def stop(self):
         """Request cooperative shutdown of all crawl activity."""
@@ -670,22 +697,84 @@ class AdvancedCrawler:
         """Return True for CSS files that should be excluded from found files."""
         return url.lower().endswith('.css')
 
-    def _read_bounded_body(self, response):
+    def is_binary_resource(self, url):
+        """Return True for binary assets we only record, never download/parse."""
+        lower = url.lower().split('?', 1)[0].split('#', 1)[0]
+        binary_exts = (
+            '.pdf',
+            '.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico', '.bmp',
+            '.zip', '.rar', '.7z', '.gz', '.tar', '.bz2', '.xz',
+            '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',  # Office documents
+            '.mp3', '.mp4', '.avi', '.mov', '.wmv', '.woff', '.woff2', '.ttf', '.eot',
+        )
+        return any(lower.endswith(ext) for ext in binary_exts)
+
+    def is_text_asset(self, url, content_type=''):
+        """Return True for JS/JSON bodies worth mining for endpoint strings."""
+        lower = url.lower().split('?', 1)[0].split('#', 1)[0]
+        if lower.endswith(('.js', '.mjs', '.json', '.map')):
+            return True
+        ct = (content_type or '').lower()
+        return any(token in ct for token in ('javascript', 'ecmascript', 'json'))
+
+    def extract_endpoints_from_text(self, text, base_url):
+        """Mine endpoint URLs from a JS/JSON body (APIs aren't HTML).
+
+        Returns absolute URLs built from: whole http(s) URLs, and quoted path
+        literals such as "/api/Account/Login" resolved against ``base_url``.
+        Obvious framework/namespace noise is dropped.
+        """
+        if not text:
+            return []
+        found = set()
+
+        for match in self._endpoint_path_re.findall(text):
+            found.add(self.normalize_url(urljoin(base_url, match)))
+
+        for match in self._endpoint_abs_re.findall(text):
+            cleaned = match.rstrip('\\",\').;:')
+            host = (urlparse(cleaned).hostname or '').lower()
+            # Drop framework noise and bogus single-label hosts (e.g. http://a).
+            if not host or host in self._endpoint_noise_hosts:
+                continue
+            if '.' not in host and ':' not in cleaned.split('//', 1)[-1]:
+                continue
+            found.add(self.normalize_url(cleaned))
+
+        return sorted(found)
+
+    def _record_mined_endpoints(self, endpoint_urls):
+        """Record mined endpoints; return the in-scope ones (for probing)."""
+        in_scope = []
+        with self.lock:
+            for endpoint in endpoint_urls:
+                if self.is_same_domain(endpoint):
+                    if endpoint not in self.api_endpoints:
+                        self.api_endpoints.add(endpoint)
+                    in_scope.append(endpoint)
+                else:
+                    self.record_out_of_scope_link(endpoint)
+        return in_scope
+
+    def _read_bounded_body(self, response, limit=None):
         """Read a bounded response body and return it decoded as text.
 
-        Reads at most ``max_response_bytes`` so a huge or streaming response
-        can't exhaust memory, transparently decompressing gzip/deflate. Returns
-        the decoded string, or ``None`` when there is nothing readable.
+        Reads at most ``limit`` bytes (default ``max_response_bytes``) so a huge
+        or streaming response can't exhaust memory, transparently decompressing
+        gzip/deflate. Returns the decoded string, or ``None`` when there is
+        nothing readable.
         """
+        if limit is None:
+            limit = self.max_response_bytes
         try:
             raw = getattr(response, 'raw', None)
             if raw is not None:
-                content = response.raw.read(self.max_response_bytes, decode_content=True)
+                content = response.raw.read(limit, decode_content=True)
             else:
-                content = response.content[:self.max_response_bytes]
+                content = response.content[:limit]
         except Exception:
             try:
-                content = response.content[:self.max_response_bytes]
+                content = response.content[:limit]
             except Exception:
                 return None
         if not content:
@@ -699,11 +788,16 @@ class AdvancedCrawler:
 
     @staticmethod
     def _looks_like_html(text):
-        """Heuristic: does this body contain markup worth parsing?"""
+        """Heuristic: is this body an HTML document worth parsing as a page?
+
+        Deliberately checks only structural document tags. Looser markers like
+        ``<a``/``<script``/``<form`` also appear inside JS bundles as string
+        literals (ckeditor, jQuery), which would misclassify a script as a page.
+        """
         if not text:
             return False
         lowered = text.lower()
-        return any(tag in lowered for tag in ('<html', '<!doctype', '<body', '<head', '<a ', '<script', '<form'))
+        return any(tag in lowered for tag in ('<html', '<!doctype', '<body', '<head'))
 
     def _request_with_safe_redirects(self, url, timeout, method='GET', max_redirects=5):
         """Follow only in-scope redirects, capturing every hop's body.
@@ -756,28 +850,33 @@ class AdvancedCrawler:
     def fetch_url_content(self, url, retries=None, timeout=None):
         """Fetch a URL with retries, parsing every message it produces.
 
-        Returns ``(final_html, extra_pages)``. ``final_html`` is the decoded
-        body of the final response (or ``None`` when there's no parsable
-        markup), parsed even on error statuses such as a 404 that still ships a
-        full HTML app shell. ``extra_pages`` is a list of ``(url, html)`` for
-        each in-scope redirect hop whose body carried markup, so the messages
-        seen *before* a redirect are parsed too, not just the final one.
+        Returns ``(final_html, extra_pages, extra_links)``:
+
+        - ``final_html``: decoded body of the final response (or ``None`` when
+          there's no HTML), parsed even on error statuses such as a 404 that
+          still ships a full HTML app shell.
+        - ``extra_pages``: ``(url, html)`` for each in-scope redirect hop whose
+          body carried markup, so messages *before* a redirect are parsed too.
+        - ``extra_links``: endpoint URLs mined from JS/JSON bodies (and JSON API
+          responses) that should be queued for crawling (only populated when
+          endpoint probing is enabled). Mined endpoints are always *recorded*
+          in ``api_endpoints`` regardless of probing.
         """
         if retries is None:
             retries = self.request_retries
         if timeout is None:
             timeout = (min(5.0, self.request_timeout), self.request_timeout)
-        # Check if this is a non-HTML resource before fetching
-        if self.is_non_html_resource(url):
+        # Binary assets (images, archives, media, fonts, docs) are recorded but
+        # never downloaded or parsed. JS/JSON/CSS fall through so JS/JSON can be
+        # mined for endpoints.
+        if self.is_binary_resource(url):
             with self.lock:
-                # Only add to found_files if it's not a CSS file
-                if not self.is_css_file(url):
-                    self.found_files.add(url)
-            return (None, [])
+                self.found_files.add(url)
+            return (None, [], [])
 
         for attempt in range(retries):
             if self._stop.is_set():
-                return (None, [])
+                return (None, [], [])
             response = None
             try:
                 # Skip the politeness delay entirely when shutting down so an
@@ -797,11 +896,17 @@ class AdvancedCrawler:
                         self.url_status.setdefault(hop_url, hop_status)
 
                 # Parse the body of each in-scope redirect hop ("before
-                # redirect" messages). Store any that carry real markup so they
-                # are analyzed and their links crawled alongside the final page.
+                # redirect" messages). Store markup so it's analyzed, and mine
+                # JS/JSON hops for endpoints.
                 extra_pages = []
+                extra_links = []
                 for hop_url, _hop_status, hop_body in hops:
-                    if self._looks_like_html(hop_body):
+                    if hop_body and self.mine_assets and self.is_text_asset(hop_url):
+                        mined = self._record_mined_endpoints(
+                            self.extract_endpoints_from_text(hop_body, hop_url))
+                        if self.probe_endpoints:
+                            extra_links.extend(mined)
+                    elif self._looks_like_html(hop_body):
                         with self.lock:
                             if hop_url not in self.url_content_map:
                                 self.url_content_map[hop_url] = hop_body
@@ -812,41 +917,63 @@ class AdvancedCrawler:
                 if not redirect_allowed:
                     if self.debug:
                         print(f"[DEBUG] Blocked out-of-scope or invalid redirect from {url}")
-                    return (None, extra_pages)
+                    return (None, extra_pages, extra_links)
 
                 content_type = response.headers.get('Content-Type', '').lower()
-                # Accept HTML-like content; for non-HTML like PDFs, record endpoint without parsing
-                if self.is_non_html_resource(url) or any(ext in content_type for ext in ['pdf', 'image', 'zip', 'octet-stream']):
+                # Binary content served from an HTML-looking URL: record, skip.
+                if any(ext in content_type for ext in ['pdf', 'image', 'zip', 'octet-stream']):
                     with self.lock:
                         self.found_files.add(url)
                         self.crawled_count += 1
-                    return (None, extra_pages)
+                    return (None, extra_pages, extra_links)
 
                 # Read the final body regardless of status code. Single-page
                 # apps and many CDNs answer with 404 (or other errors) yet still
                 # ship a complete HTML shell full of scripts, inputs and links;
-                # parsing it is the whole point of the crawl.
-                html = self._read_bounded_body(response)
+                # parsing it is the whole point of the crawl. JS/JSON bodies can
+                # be far larger than a page (bundles), so read them up to the
+                # asset cap.
+                is_text_asset = self.mine_assets and self.is_text_asset(url, content_type)
+                read_limit = self.max_asset_bytes if is_text_asset else self.max_response_bytes
+                body = self._read_bounded_body(response, read_limit)
 
                 if response.status_code == 404:
                     with self.lock:
                         self.failed_urls.add(url)
 
-                if not self._looks_like_html(html):
-                    # No usable markup. A successful (2xx) non-HTML body is a
-                    # fetchable resource (JSON/text endpoint); error bodies
-                    # without markup carry nothing to parse.
-                    if html is not None and 200 <= response.status_code < 300:
-                        with self.lock:
+                # JS/JSON: mine for endpoints, never parse as a page (a bundle
+                # contains tag-like string literals that aren't real markup).
+                if body and is_text_asset:
+                    with self.lock:
+                        if not self.is_css_file(url):
                             self.found_files.add(url)
-                            self.crawled_count += 1
-                    return (None, extra_pages)
+                        self.crawled_count += 1
+                    mined = self._record_mined_endpoints(
+                        self.extract_endpoints_from_text(body, final_url))
+                    if self.probe_endpoints:
+                        extra_links.extend(mined)
+                    return (None, extra_pages, extra_links)
 
-                with self.lock:
-                    self.url_content_map[url] = html
-                    self.crawled_count += 1
+                if self._looks_like_html(body):
+                    with self.lock:
+                        self.url_content_map[url] = body
+                        self.crawled_count += 1
+                    # Mine inline scripts for endpoints too (config/API strings
+                    # are sometimes bootstrapped straight into the page).
+                    if self.mine_assets:
+                        mined = self._record_mined_endpoints(
+                            self.extract_endpoints_from_text(body, final_url))
+                        if self.probe_endpoints:
+                            extra_links.extend(mined)
+                    return (body, extra_pages, extra_links)
 
-                return (html, extra_pages)
+                # Any other successful (2xx) body is a fetchable resource.
+                if body is not None and 200 <= response.status_code < 300:
+                    with self.lock:
+                        if not self.is_css_file(url):
+                            self.found_files.add(url)
+                        self.crawled_count += 1
+                return (None, extra_pages, extra_links)
 
             except requests.exceptions.Timeout:
                 if attempt == retries - 1:
@@ -864,7 +991,7 @@ class AdvancedCrawler:
                 if response is not None:
                     response.close()
 
-        return (None, [])
+        return (None, [], [])
 
     def debug_extract_links(self, html, base_url):
         """Debug method to see what links are being found.
@@ -992,20 +1119,22 @@ class AdvancedCrawler:
                 return [], []
             self.visited.add(url)
 
-        # Fetch content once and store it (final page + any redirect hops).
-        html, extra_pages = self.fetch_url_content(url)
-        if not html and not extra_pages and self.https_fallback and urlparse(url).scheme == 'http':
+        # Fetch content once and store it (final page + any redirect hops +
+        # endpoints mined from JS/JSON bodies).
+        html, extra_pages, extra_links = self.fetch_url_content(url)
+        if (not html and not extra_pages and not extra_links
+                and self.https_fallback and urlparse(url).scheme == 'http'):
             https_url = self.normalize_url(url.replace('http://', 'https://', 1))
             if self.is_same_domain(https_url):
                 if self.debug:
                     print(f"[DEBUG] HTTP failed; trying HTTPS fallback: {https_url}")
-                fb_html, fb_extra = self.fetch_url_content(https_url)
-                if fb_html or fb_extra:
+                fb_html, fb_extra, fb_links = self.fetch_url_content(https_url)
+                if fb_html or fb_extra or fb_links:
                     with self.lock:
                         self.visited.add(https_url)
                         self.timeout_urls.discard(url)
                         self.failed_urls.discard(url)
-                    html, extra_pages = fb_html, fb_extra
+                    html, extra_pages, extra_links = fb_html, fb_extra, fb_links
                     url = https_url
 
         # Collect every message with parsable markup: the redirect hops first
@@ -1014,17 +1143,26 @@ class AdvancedCrawler:
         if html:
             pages.append((url, html))
 
+        new_links = []
+        # Queue endpoints mined from JS/JSON (only populated when probing is on).
+        if extra_links:
+            with self.lock:
+                for raw_link in extra_links:
+                    link = self.normalize_url(raw_link)
+                    if self.is_same_domain(link) and link not in self.visited and link not in self.to_visit:
+                        self.to_visit.append(link)
+                        new_links.append(link)
+
         if not pages:
             # Nothing parsable. Still report a successfully fetched non-HTML
             # resource; a blocked redirect keeps its 3xx status for diagnostics
             # but was not crawled.
             status = self.url_status.get(url)
             if status and 200 <= status < 300:
-                return [url], []
-            return [], []
+                return [url], new_links
+            return [], new_links
 
         processed_urls = []
-        new_links = []
         for page_url, page_html in pages:
             processed_urls.append(page_url)
 
@@ -1071,6 +1209,7 @@ class AdvancedCrawler:
         self.failed_urls.clear()
         self.timeout_urls.clear()
         self.out_of_scope_links.clear()
+        self.api_endpoints.clear()
         self.crawled_count = 0
         
         if not start_url.startswith(('http://', 'https://')):
@@ -1675,6 +1814,16 @@ def main():
                      default=True, help="Do not try HTTPS when an HTTP request fails")
     parser.add_option("--max-size", dest="max_size", type="float", default=1.0,
                      help="Maximum HTML response size in MiB (default: 1)")
+    parser.add_option("--no-mine", dest="no_mine", action="store_true", default=False,
+                     help="Disable mining JS/JSON bodies for API endpoints")
+    parser.add_option("--probe-endpoints", dest="probe_endpoints", action="store_true",
+                     default=False,
+                     help="Actively GET the in-scope endpoints discovered in JS/JSON "
+                          "(off by default; a bundle can reference many "
+                          "state-changing endpoints)")
+    parser.add_option("--max-asset-size", dest="max_asset_size", type="float", default=25.0,
+                     help="Maximum JS/JSON size to download for endpoint mining, "
+                          "in MiB (default: 25)")
     parser.add_option("-c", "--cookie", dest="cookie", default=None, metavar="COOKIE",
                      help="Cookie header for an authenticated session, "
                           "e.g. -c 'sessionid=abc; csrftoken=xyz'")
@@ -1698,6 +1847,8 @@ def main():
         parser.error("--timeout must be a finite number greater than 0")
     if not math.isfinite(options.max_size) or options.max_size <= 0:
         parser.error("--max-size must be a finite number greater than 0")
+    if not math.isfinite(options.max_asset_size) or options.max_asset_size <= 0:
+        parser.error("--max-asset-size must be a finite number greater than 0")
     if options.threads <= 0:
         parser.error("--threads must be greater than 0")
     if options.retries <= 0:
@@ -1782,7 +1933,13 @@ def main():
             https_fallback=options.https_fallback,
             extra_headers=extra_headers or None,
             proxies=proxies,
+            mine_assets=not options.no_mine,
+            probe_endpoints=options.probe_endpoints,
+            max_asset_bytes=max(max_response_bytes, int(options.max_asset_size * 1024 * 1024)),
         )
+        if not options.no_mine:
+            mode = "probing" if options.probe_endpoints else "reporting only"
+            print(Fore.CYAN + f"[INFO] JS/JSON endpoint mining enabled ({mode})" + Style.RESET_ALL)
         if extra_headers:
             print(Fore.CYAN + f"[INFO] Authenticated session: sending {', '.join(sorted(extra_headers))} header(s)" + Style.RESET_ALL)
         if proxies:
@@ -1899,6 +2056,21 @@ def main():
                 status = crawler.url_status.get(file_url, "N/A")
                 print(Fore.LIGHTBLACK_EX + f"  [{status}] {file_url}" + Style.RESET_ALL)
 
+        # Endpoints mined from JS/JSON that no HTML links to (a browser only
+        # reaches them by executing the bundle, e.g. /api/... Swagger routes).
+        if crawler.api_endpoints:
+            print("["+ Fore.CYAN + "+", end="")
+            print("]",end="")
+            print(f"Endpoints discovered in JS/JSON: {len(crawler.api_endpoints)} URLs.")
+            for endpoint in sorted(crawler.api_endpoints):
+                status = crawler.url_status.get(endpoint)
+                label = f"[{status}] " if status else ""
+                print(Fore.YELLOW + f"  {label}{endpoint}" + Style.RESET_ALL)
+            if not crawler.probe_endpoints:
+                print(Fore.LIGHTBLACK_EX +
+                      "  (reported only; re-run with --probe-endpoints to GET them)"
+                      + Style.RESET_ALL)
+
         # Print sensitive comments summary
         sensitive_count = sum(1 for ep in endpoints if ep.sensitive_comments)
         if sensitive_count > 0:
@@ -1971,7 +2143,15 @@ def main():
                         writer.writerow(["Found Files:"])
                         for file_url in sorted(crawler.found_files):
                             writer.writerow([file_url, "", "", "", "", "", "", "", ""])
-                    
+
+                    # Add endpoints mined from JS/JSON
+                    if crawler.api_endpoints:
+                        writer.writerow([])
+                        writer.writerow(["Endpoints discovered in JS/JSON:"])
+                        for endpoint in sorted(crawler.api_endpoints):
+                            status = crawler.url_status.get(endpoint, "")
+                            writer.writerow([endpoint, "", "", "", "", "", "", "", status])
+
                     # Add failed URLs to CSV (separated from alive endpoints)
                     if crawler.failed_urls:
                         writer.writerow([])
@@ -2020,6 +2200,10 @@ def main():
                     "duration_seconds": round(total_time, 2),
                     "endpoints": [endpoint_to_dict(ep) for ep in endpoints],
                     "found_files": sorted(crawler.found_files) if crawler.found_files else [],
+                    "endpoints_discovered_in_js_json": (
+                        [{"url": e, "status": crawler.url_status.get(e)} for e in sorted(crawler.api_endpoints)]
+                        if crawler.api_endpoints else []
+                    ),
                     "failed_urls_404": sorted(crawler.failed_urls) if crawler.failed_urls else [],
                     "timeout_urls": sorted(crawler.timeout_urls) if crawler.timeout_urls else [],
                     "out_of_scope_links_not_visited": sorted(crawler.out_of_scope_links) if crawler.out_of_scope_links else [],
