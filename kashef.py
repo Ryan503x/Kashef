@@ -489,7 +489,19 @@ class AdvancedCrawler:
         self._stop = threading.Event()
         # A single LinkExtractor is reusable and thread-safe for extract_links;
         # constructing a new one per page was needless per-request overhead.
-        self._link_extractor = LinkExtractor()
+        #
+        # The default extractor only reads <a>/<area> href, so a JavaScript
+        # app shell (no anchors, just <script src>/<link href>) yields nothing.
+        # Widen it to every tag that references a resource and don't drop any
+        # extension (deny_extensions=()) so asset paths like ./assets/...,
+        # env.js and main.<hash>.js are discovered and reported.
+        self._link_extractor = LinkExtractor(
+            tags=('a', 'area', 'link', 'script', 'img', 'iframe',
+                  'source', 'embed', 'audio', 'video', 'object', 'track', 'form'),
+            attrs=('href', 'src', 'action', 'data-src', 'data-href', 'poster'),
+            deny_extensions=(),
+            canonicalize=False,
+        )
 
     def stop(self):
         """Request cooperative shutdown of all crawl activity."""
@@ -1874,7 +1886,19 @@ def main():
         print("["+ Fore.CYAN + "+", end="")
         print("]",end="")
         print(f"Timeout URLs: {len(crawler.timeout_urls)} URLs.")
-        
+
+        # Discovered files (scripts, assets, docs) referenced by the pages but
+        # not crawled as HTML. Shown with the status found when they were
+        # probed so the operator sees exactly what the app loads (env.js,
+        # main.<hash>.js, etc.).
+        if crawler.found_files:
+            print("["+ Fore.CYAN + "+", end="")
+            print("]",end="")
+            print(f"Found files: {len(crawler.found_files)} URLs.")
+            for file_url in sorted(crawler.found_files):
+                status = crawler.url_status.get(file_url, "N/A")
+                print(Fore.LIGHTBLACK_EX + f"  [{status}] {file_url}" + Style.RESET_ALL)
+
         # Print sensitive comments summary
         sensitive_count = sum(1 for ep in endpoints if ep.sensitive_comments)
         if sensitive_count > 0:
