@@ -1332,15 +1332,30 @@ class AdvancedCrawler:
             self.visit_found_files()
 
     def visit_found_files(self):
-        """Visit found files to get their actual status codes"""
-        if not self.found_files or self._stop.is_set():
+        """Visit found files (and discovered endpoints) for their status codes.
+
+        Any URL that was already fetched during the crawl keeps the status that
+        real request returned; only URLs with no status yet are probed here, so
+        every discovered file and endpoint ends up with an accurate code.
+        """
+        if self._stop.is_set():
+            return
+
+        # Static files are always safe to probe for a status. Mined API
+        # endpoints are only visited when probing is enabled, so report-only
+        # runs never touch them.
+        candidates = set(self.found_files)
+        if self.probe_endpoints:
+            candidates |= set(self.api_endpoints)
+        pending = [u for u in candidates if not isinstance(self.url_status.get(u), int)]
+        if not pending:
             return
 
         executor = ThreadPoolExecutor(max_workers=min(5, self.max_workers))
         try:
-            # Submit all found files for status checking
+            # Submit every URL still missing a status for checking.
             futures = []
-            for file_url in self.found_files:
+            for file_url in pending:
                 if self._stop.is_set():
                     break
                 future = executor.submit(self.check_file_status, file_url)
@@ -1363,14 +1378,29 @@ class AdvancedCrawler:
             executor.shutdown(wait=False, cancel_futures=True)
 
     def check_file_status(self, url):
-        """Check a file status without following redirects outside scope."""
+        """Check a file status without following redirects outside scope.
+
+        Tries HEAD first (cheap), but many servers answer HEAD with 405/501 or
+        reject it outright even when GET works, so fall back to GET in those
+        cases to report the status a real request would actually get.
+        """
         timeout = (5, 10)
         response = None
         try:
             response, _final_url, allowed, _hops = self._request_with_safe_redirects(
                 url, timeout, method='HEAD'
             )
-            return response.status_code if allowed else None
+            if not allowed:
+                return None
+            # HEAD unsupported/blocked: retry with GET for an accurate code.
+            if response.status_code in (400, 403, 405, 501):
+                response.close()
+                response = None
+                response, _final_url, allowed, _hops = self._request_with_safe_redirects(
+                    url, timeout, method='GET'
+                )
+                return response.status_code if allowed else None
+            return response.status_code
         except requests.exceptions.RequestException:
             if response is not None:
                 response.close()
@@ -2048,11 +2078,13 @@ def main():
         # not crawled as HTML. Shown with the status found when they were
         # probed so the operator sees exactly what the app loads (env.js,
         # main.<hash>.js, etc.).
-        if crawler.found_files:
+        # Static files (don't repeat ones that are also mined endpoints).
+        file_only = sorted(f for f in crawler.found_files if f not in crawler.api_endpoints)
+        if file_only:
             print("["+ Fore.CYAN + "+", end="")
             print("]",end="")
-            print(f"Found files: {len(crawler.found_files)} URLs.")
-            for file_url in sorted(crawler.found_files):
+            print(f"Found files: {len(file_only)} URLs.")
+            for file_url in file_only:
                 status = crawler.url_status.get(file_url, "N/A")
                 print(Fore.LIGHTBLACK_EX + f"  [{status}] {file_url}" + Style.RESET_ALL)
 
@@ -2061,14 +2093,31 @@ def main():
         if crawler.api_endpoints:
             print("["+ Fore.CYAN + "+", end="")
             print("]",end="")
-            print(f"Endpoints discovered in JS/JSON: {len(crawler.api_endpoints)} URLs.")
-            for endpoint in sorted(crawler.api_endpoints):
-                status = crawler.url_status.get(endpoint)
-                label = f"[{status}] " if status else ""
-                print(Fore.YELLOW + f"  {label}{endpoint}" + Style.RESET_ALL)
-            if not crawler.probe_endpoints:
+            if crawler.probe_endpoints:
+                # After visiting them, show only the ones that exist (non-404)
+                # with the status code a real GET returned.
+                alive = []
+                hidden_404 = 0
+                for endpoint in sorted(crawler.api_endpoints):
+                    status = crawler.url_status.get(endpoint)
+                    if status == 404:
+                        hidden_404 += 1
+                    else:
+                        alive.append((endpoint, status))
+                print(f"Live endpoints discovered in JS/JSON: {len(alive)} "
+                      f"(of {len(crawler.api_endpoints)} mined; {hidden_404} returned 404).")
+                for endpoint, status in alive:
+                    label = f"[{status}] " if status is not None else "[?] "
+                    print(Fore.YELLOW + f"  {label}{endpoint}" + Style.RESET_ALL)
+            else:
+                print(f"Endpoints discovered in JS/JSON: {len(crawler.api_endpoints)} URLs.")
+                for endpoint in sorted(crawler.api_endpoints):
+                    status = crawler.url_status.get(endpoint)
+                    label = f"[{status}] " if isinstance(status, int) else ""
+                    print(Fore.YELLOW + f"  {label}{endpoint}" + Style.RESET_ALL)
                 print(Fore.LIGHTBLACK_EX +
-                      "  (reported only; re-run with --probe-endpoints to GET them)"
+                      "  (reported only; re-run with --probe-endpoints to visit them "
+                      "and show live, non-404 endpoints)"
                       + Style.RESET_ALL)
 
         # Print sensitive comments summary
@@ -2142,7 +2191,8 @@ def main():
                         writer.writerow([])
                         writer.writerow(["Found Files:"])
                         for file_url in sorted(crawler.found_files):
-                            writer.writerow([file_url, "", "", "", "", "", "", "", ""])
+                            status = crawler.url_status.get(file_url, "")
+                            writer.writerow([file_url, "", "", "", "", "", "", "", status])
 
                     # Add endpoints mined from JS/JSON
                     if crawler.api_endpoints:
@@ -2199,7 +2249,10 @@ def main():
                     "total_urls_crawled": total_crawled,
                     "duration_seconds": round(total_time, 2),
                     "endpoints": [endpoint_to_dict(ep) for ep in endpoints],
-                    "found_files": sorted(crawler.found_files) if crawler.found_files else [],
+                    "found_files": (
+                        [{"url": f, "status": crawler.url_status.get(f)} for f in sorted(crawler.found_files)]
+                        if crawler.found_files else []
+                    ),
                     "endpoints_discovered_in_js_json": (
                         [{"url": e, "status": crawler.url_status.get(e)} for e in sorted(crawler.api_endpoints)]
                         if crawler.api_endpoints else []
