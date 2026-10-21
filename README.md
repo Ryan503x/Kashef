@@ -1,4 +1,4 @@
-# ParaCrawler
+# Kashef
 
 أداة زحف واستطلاع لتطبيقات الويب مكتوبة بلغة بايثون، تساعد مختبري الاختراق والباحثين الأمنيين على اكتشاف الروابط والمعاملات وحقول الإدخال، وجمع مؤشرات قد تكون مفيدة أثناء مرحلة الاستطلاع وتحليل سطح الهجوم.
 
@@ -24,8 +24,8 @@
 ### استنساخ المستودع
 
 ```bash
-git clone https://github.com/Ryan503x/ParaCrawler.git
-cd ParaCrawler
+git clone https://github.com/Ryan503x/Kashef.git
+cd Kashef
 ```
 
 ### تثبيت الاعتماديات
@@ -37,20 +37,20 @@ python -m pip install -r requirements.txt
 ## الاستخدام السريع
 
 ```bash
-python paracrawler.py -u https://example.com
+python kashef.py -u https://example.com
 ```
 
 
 ### تضمين النطاقات الفرعية
 
 ```bash
-python paracrawler.py -u https://example.com --subdomains
+python kashef.py -u https://example.com --subdomains
 ```
 
 حفظ النتائج بصيغة CSV:
 
 ```bash
-python paracrawler.py -u https://example.com -o results.csv
+python kashef.py -u https://example.com -o results.csv
 ```
 
 يتضمن ملخص الطرفية وملفا CSV وJSON الروابط المكتشفة خارج النطاق تحت قسم
@@ -76,4 +76,4 @@ python paracrawler.py -u https://example.com -o results.csv
 
 
 
-- المستودع: `https://github.com/Ryan503x/ParaCrawler`
+- المستودع: `https://github.com/Ryan503x/Kashef`

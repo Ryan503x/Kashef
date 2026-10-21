@@ -499,7 +499,7 @@ class AdvancedCrawler:
         """Create a configured HTTP session for one worker thread."""
         session = requests.Session()
         session.headers.update({
-            'User-Agent': 'ParaCrawler/1.0 (+https://github.com/Ryan503x/ParaCrawler)',
+            'User-Agent': 'Kashef/1.0 (+https://github.com/Ryan503x/Kashef)',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
             'Connection': 'keep-alive',
@@ -517,7 +517,7 @@ class AdvancedCrawler:
         adapter = requests.adapters.HTTPAdapter(
             pool_connections=self.max_workers,
             pool_maxsize=self.max_workers,
-            # ParaCrawler owns retry policy through --retries. Keeping adapter
+            # Kashef owns retry policy through --retries. Keeping adapter
             # retries disabled prevents each attempt from silently doubling.
             max_retries=0,
             pool_block=True,
@@ -658,34 +658,82 @@ class AdvancedCrawler:
         """Return True for CSS files that should be excluded from found files."""
         return url.lower().endswith('.css')
 
+    def _read_bounded_body(self, response):
+        """Read a bounded response body and return it decoded as text.
+
+        Reads at most ``max_response_bytes`` so a huge or streaming response
+        can't exhaust memory, transparently decompressing gzip/deflate. Returns
+        the decoded string, or ``None`` when there is nothing readable.
+        """
+        try:
+            raw = getattr(response, 'raw', None)
+            if raw is not None:
+                content = response.raw.read(self.max_response_bytes, decode_content=True)
+            else:
+                content = response.content[:self.max_response_bytes]
+        except Exception:
+            try:
+                content = response.content[:self.max_response_bytes]
+            except Exception:
+                return None
+        if not content:
+            return None
+        for encoding in ('utf-8', 'latin-1'):
+            try:
+                return content.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return None
+
+    @staticmethod
+    def _looks_like_html(text):
+        """Heuristic: does this body contain markup worth parsing?"""
+        if not text:
+            return False
+        lowered = text.lower()
+        return any(tag in lowered for tag in ('<html', '<!doctype', '<body', '<head', '<a ', '<script', '<form'))
+
     def _request_with_safe_redirects(self, url, timeout, method='GET', max_redirects=5):
-        """Follow only in-scope redirects and return the final response."""
+        """Follow only in-scope redirects, capturing every hop's body.
+
+        Returns ``(final_response, final_url, redirect_allowed, hops)`` where
+        ``hops`` is a list of ``(hop_url, status_code, body_or_None)`` for each
+        redirect response seen along the way. Reading each hop's body lets the
+        caller parse the "before redirect" messages (meta-refresh pages,
+        interstitials) in addition to the final response.
+        """
         session = self.get_session()
         current_url = url
         redirect_codes = {301, 302, 303, 307, 308}
         request = getattr(session, method.lower())
+        is_get = method.upper() == 'GET'
+        hops = []
 
         for _ in range(max_redirects + 1):
             request_options = {
                 'timeout': timeout,
                 'allow_redirects': False,
             }
-            if method.upper() == 'GET':
+            if is_get:
                 request_options['stream'] = True
             response = request(current_url, **request_options)
             if response.status_code not in redirect_codes:
-                return response, current_url, True
+                return response, current_url, True, hops
 
             location = response.headers.get('Location')
             if not location:
-                return response, current_url, False
+                return response, current_url, False, hops
 
             next_url = self.normalize_url(urljoin(current_url, location))
             if not self.is_same_domain(next_url):
                 with self.lock:
                     self.record_out_of_scope_link(next_url)
-                return response, current_url, False
+                return response, current_url, False, hops
 
+            # Capture this redirect's own body before discarding it, so a hop
+            # that carries real markup still gets parsed.
+            hop_body = self._read_bounded_body(response) if is_get else None
+            hops.append((current_url, response.status_code, hop_body))
             response.close()
             current_url = next_url
 
@@ -694,7 +742,15 @@ class AdvancedCrawler:
         )
 
     def fetch_url_content(self, url, retries=None, timeout=None):
-        """Fetch and retain a bounded HTML response with retries."""
+        """Fetch a URL with retries, parsing every message it produces.
+
+        Returns ``(final_html, extra_pages)``. ``final_html`` is the decoded
+        body of the final response (or ``None`` when there's no parsable
+        markup), parsed even on error statuses such as a 404 that still ships a
+        full HTML app shell. ``extra_pages`` is a list of ``(url, html)`` for
+        each in-scope redirect hop whose body carried markup, so the messages
+        seen *before* a redirect are parsed too, not just the final one.
+        """
         if retries is None:
             retries = self.request_retries
         if timeout is None:
@@ -705,11 +761,11 @@ class AdvancedCrawler:
                 # Only add to found_files if it's not a CSS file
                 if not self.is_css_file(url):
                     self.found_files.add(url)
-            return None
+            return (None, [])
 
         for attempt in range(retries):
             if self._stop.is_set():
-                return None
+                return (None, [])
             response = None
             try:
                 # Skip the politeness delay entirely when shutting down so an
@@ -718,56 +774,68 @@ class AdvancedCrawler:
                 if high > 0 and not self._stop.is_set():
                     time.sleep(random.uniform(low, high))
 
-                response, final_url, redirect_allowed = self._request_with_safe_redirects(url, timeout)
+                response, final_url, redirect_allowed, hops = self._request_with_safe_redirects(url, timeout)
 
-                # Record both the requested URL and the final in-scope URL.
+                # Record the requested URL, the final in-scope URL, and the
+                # status of every redirect hop we passed through.
                 with self.lock:
                     self.url_status[url] = response.status_code
                     self.url_status[final_url] = response.status_code
+                    for hop_url, hop_status, _hop_body in hops:
+                        self.url_status.setdefault(hop_url, hop_status)
+
+                # Parse the body of each in-scope redirect hop ("before
+                # redirect" messages). Store any that carry real markup so they
+                # are analyzed and their links crawled alongside the final page.
+                extra_pages = []
+                for hop_url, _hop_status, hop_body in hops:
+                    if self._looks_like_html(hop_body):
+                        with self.lock:
+                            if hop_url not in self.url_content_map:
+                                self.url_content_map[hop_url] = hop_body
+                                self.crawled_count += 1
+                            self.visited.add(hop_url)
+                        extra_pages.append((hop_url, hop_body))
 
                 if not redirect_allowed:
                     if self.debug:
                         print(f"[DEBUG] Blocked out-of-scope or invalid redirect from {url}")
-                    return None
+                    return (None, extra_pages)
 
-                if response.status_code == 404:
-                    with self.lock:
-                        self.failed_urls.add(url)
-                    return None
-                elif response.status_code not in [200, 301, 302, 303, 307, 308]:
-                    return None
-                
                 content_type = response.headers.get('Content-Type', '').lower()
                 # Accept HTML-like content; for non-HTML like PDFs, record endpoint without parsing
                 if self.is_non_html_resource(url) or any(ext in content_type for ext in ['pdf', 'image', 'zip', 'octet-stream']):
                     with self.lock:
                         self.found_files.add(url)
                         self.crawled_count += 1
-                    return None
-                
-                content = response.raw.read(self.max_response_bytes, decode_content=True)
+                    return (None, extra_pages)
 
-                try:
-                    html = content.decode('utf-8')
-                except UnicodeDecodeError:
-                    try:
-                        html = content.decode('latin-1')
-                    except UnicodeDecodeError:
-                        return None
-                
-                # Additional check: verify it's actually HTML content
-                if not any(tag in html.lower() for tag in ['<html', '<!doctype', '<body', '<head']):
+                # Read the final body regardless of status code. Single-page
+                # apps and many CDNs answer with 404 (or other errors) yet still
+                # ship a complete HTML shell full of scripts, inputs and links;
+                # parsing it is the whole point of the crawl.
+                html = self._read_bounded_body(response)
+
+                if response.status_code == 404:
                     with self.lock:
-                        self.found_files.add(url)
-                        self.crawled_count += 1
-                    return None
-                
+                        self.failed_urls.add(url)
+
+                if not self._looks_like_html(html):
+                    # No usable markup. A successful (2xx) non-HTML body is a
+                    # fetchable resource (JSON/text endpoint); error bodies
+                    # without markup carry nothing to parse.
+                    if html is not None and 200 <= response.status_code < 300:
+                        with self.lock:
+                            self.found_files.add(url)
+                            self.crawled_count += 1
+                    return (None, extra_pages)
+
                 with self.lock:
                     self.url_content_map[url] = html
                     self.crawled_count += 1
-                
-                return html
-                
+
+                return (html, extra_pages)
+
             except requests.exceptions.Timeout:
                 if attempt == retries - 1:
                     with self.lock:
@@ -784,7 +852,7 @@ class AdvancedCrawler:
                 if response is not None:
                     response.close()
 
-        return None
+        return (None, [])
 
     def debug_extract_links(self, html, base_url):
         """Debug method to see what links are being found.
@@ -894,78 +962,95 @@ class AdvancedCrawler:
         return sorted(routes)
 
     def crawl_worker(self, url):
-        """Worker function for crawling URLs - FIXED FOR SUBDOMAIN RECURSION"""
+        """Worker function for crawling URLs - FIXED FOR SUBDOMAIN RECURSION
+
+        Returns ``(processed_urls, new_links)``. ``processed_urls`` is a list
+        because a single request can yield several parsable messages: the final
+        page plus every in-scope redirect hop ("before redirect" bodies).
+        """
         # Bail immediately if a shutdown was requested (Ctrl+C / limit reached).
         if self._stop.is_set():
-            return None, []
+            return [], []
         # SECURITY CHECK: Verify URL is from the same domain before processing
         if not self.is_same_domain(url):
-            return None, []
-            
+            return [], []
+
         with self.lock:
             if url in self.visited:
-                return None, []
+                return [], []
             self.visited.add(url)
-        
-        # Fetch content once and store it
-        html = self.fetch_url_content(url)
-        if not html and self.https_fallback and urlparse(url).scheme == 'http':
+
+        # Fetch content once and store it (final page + any redirect hops).
+        html, extra_pages = self.fetch_url_content(url)
+        if not html and not extra_pages and self.https_fallback and urlparse(url).scheme == 'http':
             https_url = self.normalize_url(url.replace('http://', 'https://', 1))
             if self.is_same_domain(https_url):
                 if self.debug:
                     print(f"[DEBUG] HTTP failed; trying HTTPS fallback: {https_url}")
-                html = self.fetch_url_content(https_url)
-                if html:
+                fb_html, fb_extra = self.fetch_url_content(https_url)
+                if fb_html or fb_extra:
                     with self.lock:
                         self.visited.add(https_url)
                         self.timeout_urls.discard(url)
                         self.failed_urls.discard(url)
+                    html, extra_pages = fb_html, fb_extra
                     url = https_url
 
-        if not html:
-            # Only yield a successfully fetched non-HTML response. A blocked
-            # redirect retains its 3xx status for diagnostics but was not crawled.
+        # Collect every message with parsable markup: the redirect hops first
+        # (in the order they were seen), then the final page.
+        pages = list(extra_pages)
+        if html:
+            pages.append((url, html))
+
+        if not pages:
+            # Nothing parsable. Still report a successfully fetched non-HTML
+            # resource; a blocked redirect keeps its 3xx status for diagnostics
+            # but was not crawled.
             status = self.url_status.get(url)
             if status and 200 <= status < 300:
-                return url, []
-            return None, []
-        
-        # Use debug method for detailed link analysis
-        links = self.debug_extract_links(html, url)
-        
-        # ENHANCED: Discover SvelteKit specific routes
-        sveltekit_routes = self.discover_sveltekit_routes(html, url)
-        links.extend(sveltekit_routes)
-        if self.debug and sveltekit_routes:
-            print(f"[DEBUG] Found {len(sveltekit_routes)} SvelteKit routes")
-        
-        # Debug: Print extracted links
-        if self.debug and links:
-            print(f"[DEBUG] Extracted {len(links)} links from {url}")
-            for link in list(links)[:10]:  # Show first 10 links
-                print(f"  -> {link}")
-            if len(links) > 10:
-                print(f"  ... and {len(links) - 10} more")
-        
-        # Discover subdomains if enabled
-        if self.crawl_subdomains:
-            subdomains = self.discover_subdomains_from_html(html, url)
-            # Add subdomains to links for crawling
-            links.extend(subdomains)
-        
+                return [url], []
+            return [], []
+
+        processed_urls = []
         new_links = []
-        with self.lock:
-            for raw_link in links:
-                link = self.normalize_url(raw_link)
-                if self.is_same_domain(link) and link not in self.visited and link not in self.to_visit:
-                    self.to_visit.append(link)
-                    new_links.append(link)
-                elif self.record_out_of_scope_link(link):
-                    if self.debug:
-                        parsed = urlparse(link)
-                        print(f"[DEBUG] Rejected link (domain mismatch): {link} (domain: {parsed.netloc}, base: {self.base_domain})")
-        
-        return url, new_links
+        for page_url, page_html in pages:
+            processed_urls.append(page_url)
+
+            # Use debug method for detailed link analysis
+            links = self.debug_extract_links(page_html, page_url)
+
+            # ENHANCED: Discover SvelteKit specific routes
+            sveltekit_routes = self.discover_sveltekit_routes(page_html, page_url)
+            links.extend(sveltekit_routes)
+            if self.debug and sveltekit_routes:
+                print(f"[DEBUG] Found {len(sveltekit_routes)} SvelteKit routes")
+
+            # Debug: Print extracted links
+            if self.debug and links:
+                print(f"[DEBUG] Extracted {len(links)} links from {page_url}")
+                for link in list(links)[:10]:  # Show first 10 links
+                    print(f"  -> {link}")
+                if len(links) > 10:
+                    print(f"  ... and {len(links) - 10} more")
+
+            # Discover subdomains if enabled
+            if self.crawl_subdomains:
+                subdomains = self.discover_subdomains_from_html(page_html, page_url)
+                # Add subdomains to links for crawling
+                links.extend(subdomains)
+
+            with self.lock:
+                for raw_link in links:
+                    link = self.normalize_url(raw_link)
+                    if self.is_same_domain(link) and link not in self.visited and link not in self.to_visit:
+                        self.to_visit.append(link)
+                        new_links.append(link)
+                    elif self.record_out_of_scope_link(link):
+                        if self.debug:
+                            parsed = urlparse(link)
+                            print(f"[DEBUG] Rejected link (domain mismatch): {link} (domain: {parsed.netloc}, base: {self.base_domain})")
+
+        return processed_urls, new_links
 
     def run_crawler(self, start_url, max_urls=None, seed_urls=None):
         """Main crawler function with optional limits - IMPROVED"""
@@ -1040,6 +1125,7 @@ class AdvancedCrawler:
         executor = ThreadPoolExecutor(max_workers=self.max_workers)
         in_flight = {}          # Future -> url
         dispatched = 0          # total URLs handed to workers (bounds max_urls)
+        yielded = set()         # processed URLs already surfaced (dedupe hops)
         # A little headroom over max_workers keeps threads fed while results are
         # being consumed, without letting the pending queue grow unbounded.
         max_in_flight = self.max_workers * 2
@@ -1072,9 +1158,11 @@ class AdvancedCrawler:
                 for future in done:
                     in_flight.pop(future, None)
                     try:
-                        url, _new_links = future.result()
-                        if url:
-                            yield url
+                        processed_urls, _new_links = future.result()
+                        for processed_url in processed_urls:
+                            if processed_url and processed_url not in yielded:
+                                yielded.add(processed_url)
+                                yield processed_url
                     except Exception as error:
                         if self.debug:
                             print(f"[DEBUG] Worker error: {error}")
@@ -1128,7 +1216,7 @@ class AdvancedCrawler:
         timeout = (5, 10)
         response = None
         try:
-            response, _final_url, allowed = self._request_with_safe_redirects(
+            response, _final_url, allowed, _hops = self._request_with_safe_redirects(
                 url, timeout, method='HEAD'
             )
             return response.status_code if allowed else None
@@ -1137,7 +1225,7 @@ class AdvancedCrawler:
                 response.close()
                 response = None
             try:
-                response, _final_url, allowed = self._request_with_safe_redirects(
+                response, _final_url, allowed, _hops = self._request_with_safe_redirects(
                     url, timeout, method='GET'
                 )
                 return response.status_code if allowed else None
@@ -1660,8 +1748,8 @@ def main():
         else:
             print(Fore.RED + "Error: Base URL is required. Use -u/--url, or import "
                              "a URL list with -i/--import.")
-            print("Example: python paracrawler.py -u https://example.com")
-            print("Example: python paracrawler.py -i urls.txt")
+            print("Example: python kashef.py -u https://example.com")
+            print("Example: python kashef.py -i urls.txt")
             return
 
     print_color_legend()
@@ -1695,11 +1783,13 @@ def main():
         try:
           for url in crawl_generator:
             status = crawler.url_status.get(url)
-            # Skip 404 and other error status codes, only process successful ones
-            if status and status >= 400:
+            html_content = crawler.url_content_map.get(url)
+            # Skip error status codes only when there's nothing to parse. An
+            # error page (e.g. a 404 SPA shell) that still returned real HTML is
+            # worth analyzing, so fall through when we captured its content.
+            if status and status >= 400 and not html_content:
                 continue
 
-            html_content = crawler.url_content_map.get(url)
             ep = None
             if html_content is not None and html_content != '':
                 ep = Endpoint(url, html_content, debug=debug)
